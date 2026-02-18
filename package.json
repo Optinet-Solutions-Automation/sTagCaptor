@@ -1,0 +1,12 @@
+{
+  "name": "stag-captor-api",
+  "version": "1.0.0",
+  "description": "API that traces HTTP redirects and returns the final URL",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "express": "^4.21.0"
+  }
+}
