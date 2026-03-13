@@ -1,3 +1,4 @@
+require("dotenv").config();
 const express = require("express");
 const http = require("http");
 const https = require("https");
@@ -7,10 +8,13 @@ const { URL } = require("url");
 const app = express();
 const PORT = process.env.PORT || 3500;
 
-const MAX_HOPS = 20;
-const MAX_RETRIES = 3;
-const RETRY_DELAY_MS = 1000;
-const TIMEOUT_MS = 10000;
+const MAX_HOPS = parseInt(process.env.MAX_HOPS) || 20;
+const MAX_RETRIES = parseInt(process.env.MAX_RETRIES) || 3;
+const RETRY_DELAY_MS = parseInt(process.env.RETRY_DELAY_MS) || 1000;
+const TIMEOUT_MS = parseInt(process.env.TIMEOUT_MS) || 10000;
+const TRACKING_PARAMS = (process.env.TRACKING_PARAMS || "btag,stag,cxd,mid,affid")
+  .split(",")
+  .map((p) => p.trim().toLowerCase());
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
@@ -39,6 +43,16 @@ function buildRequestHeaders(referer) {
     headers["Sec-Fetch-Site"] = "cross-site";
   }
   return headers;
+}
+
+function hasTrackingParams(url) {
+  try {
+    const parsed = new URL(url);
+    const keys = [...parsed.searchParams.keys()].map((k) => k.toLowerCase());
+    return TRACKING_PARAMS.some((param) => keys.includes(param));
+  } catch {
+    return false;
+  }
 }
 
 function buildProxyAuthHeader(proxy) {
@@ -223,27 +237,37 @@ async function traceRedirectsOnce(startUrl, proxyUrl) {
   let referer = null;
   let hops = 0;
 
+  // Check if the starting URL already has tracking params
+  if (hasTrackingParams(currentUrl)) {
+    return { finalUrl: currentUrl, status: null, hops, found: true };
+  }
+
   while (true) {
     const { statusCode, headers } = proxyUrl
       ? await requestViaProxy(currentUrl, proxyUrl, referer)
       : await requestDirect(currentUrl, referer);
 
     if (!REDIRECT_CODES.has(statusCode)) {
-      return { finalUrl: currentUrl, status: statusCode, hops };
+      return { finalUrl: currentUrl, status: statusCode, hops, found: hasTrackingParams(currentUrl) };
     }
 
     hops++;
     if (hops > MAX_HOPS) {
-      throw new Error(`Too many redirects (exceeded ${MAX_HOPS} hops)`);
+      return { finalUrl: currentUrl, status: statusCode, hops, found: false };
     }
 
     const location = headers.location;
     if (!location) {
-      return { finalUrl: currentUrl, status: statusCode, hops: hops - 1 };
+      return { finalUrl: currentUrl, status: statusCode, hops: hops - 1, found: hasTrackingParams(currentUrl) };
     }
 
     referer = currentUrl;
     currentUrl = new URL(location, currentUrl).href;
+
+    // Check each hop — stop early if tracking params found
+    if (hasTrackingParams(currentUrl)) {
+      return { finalUrl: currentUrl, status: statusCode, hops, found: true };
+    }
   }
 }
 
@@ -253,7 +277,7 @@ async function traceRedirects(startUrl, proxyUrl) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     lastResult = await traceRedirectsOnce(startUrl, proxyUrl);
 
-    if (lastResult.status >= 200 && lastResult.status < 300) {
+    if (lastResult.found) {
       lastResult.attempts = attempt;
       return lastResult;
     }
@@ -299,9 +323,9 @@ app.get("/trace", async (req, res) => {
   }
 
   try {
-    const { finalUrl, status, hops, attempts } = await traceRedirects(url, proxy || null);
+    const { finalUrl, status, hops, attempts, found } = await traceRedirects(url, proxy || null);
 
-    const response = { input_url: url, final_url: finalUrl, status, hops, attempts };
+    const response = { input_url: url, final_url: finalUrl, status, hops, attempts, tracking_found: found };
     if (proxy) response.proxy = proxy;
 
     return res.json(response);
