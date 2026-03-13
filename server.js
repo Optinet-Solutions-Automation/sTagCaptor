@@ -253,7 +253,7 @@ async function traceRedirects(startUrl, proxyUrl) {
   for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
     lastResult = await traceRedirectsOnce(startUrl, proxyUrl);
 
-    if (lastResult.status === 200) {
+    if (lastResult.status >= 200 && lastResult.status < 300) {
       lastResult.attempts = attempt;
       return lastResult;
     }
