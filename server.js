@@ -8,13 +8,38 @@ const app = express();
 const PORT = process.env.PORT || 3500;
 
 const MAX_HOPS = 20;
+const MAX_RETRIES = 3;
+const RETRY_DELAY_MS = 1000;
 const TIMEOUT_MS = 10000;
 const USER_AGENT =
   "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
 const REDIRECT_CODES = new Set([301, 302, 303, 307, 308]);
 
+const BROWSER_HEADERS = {
+  "User-Agent": USER_AGENT,
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8",
+  "Accept-Language": "en-US,en;q=0.9",
+  "Accept-Encoding": "identity",
+  "Cache-Control": "no-cache",
+  Connection: "keep-alive",
+  "Upgrade-Insecure-Requests": "1",
+  "Sec-Fetch-Dest": "document",
+  "Sec-Fetch-Mode": "navigate",
+  "Sec-Fetch-Site": "none",
+  "Sec-Fetch-User": "?1",
+};
+
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+function buildRequestHeaders(referer) {
+  const headers = { ...BROWSER_HEADERS };
+  if (referer) {
+    headers["Referer"] = referer;
+    headers["Sec-Fetch-Site"] = "cross-site";
+  }
+  return headers;
+}
 
 function buildProxyAuthHeader(proxy) {
   if (!proxy.username) return null;
@@ -24,7 +49,7 @@ function buildProxyAuthHeader(proxy) {
 
 // ─── Direct request (no proxy) ────────────────────────────────────────────────
 
-function requestDirect(targetUrl) {
+function requestDirect(targetUrl, referer) {
   return new Promise((resolve, reject) => {
     let parsed;
     try {
@@ -37,7 +62,7 @@ function requestDirect(targetUrl) {
 
     const req = transport.get(
       targetUrl,
-      { headers: { "User-Agent": USER_AGENT }, timeout: TIMEOUT_MS },
+      { headers: buildRequestHeaders(referer), timeout: TIMEOUT_MS },
       (res) => {
         res.resume();
         resolve({ statusCode: res.statusCode, headers: res.headers });
@@ -62,7 +87,7 @@ function requestDirect(targetUrl) {
  * - HTTP  target → forward full URL to proxy as the request path
  * - HTTPS target → send CONNECT to open a tunnel, then negotiate TLS inside it
  */
-function requestViaProxy(targetUrl, proxyUrl) {
+function requestViaProxy(targetUrl, proxyUrl, referer) {
   return new Promise((resolve, reject) => {
     let target, proxy;
     try {
@@ -107,6 +132,8 @@ function requestViaProxy(targetUrl, proxyUrl) {
           { socket, servername: target.hostname, rejectUnauthorized: false },
           () => {
             const reqPath = (target.pathname || "/") + (target.search || "");
+            const reqHeaders = buildRequestHeaders(referer);
+            reqHeaders.Host = target.hostname;
 
             const innerReq = https.request(
               {
@@ -115,7 +142,7 @@ function requestViaProxy(targetUrl, proxyUrl) {
                 port: targetPort,
                 path: reqPath,
                 method: "GET",
-                headers: { "User-Agent": USER_AGENT, Host: target.hostname },
+                headers: reqHeaders,
                 timeout: TIMEOUT_MS,
               },
               (innerRes) => {
@@ -150,7 +177,8 @@ function requestViaProxy(targetUrl, proxyUrl) {
       connectReq.end();
     } else {
       // ── Plain HTTP: send full URL as the request path ───────────────────
-      const reqHeaders = { "User-Agent": USER_AGENT, Host: target.hostname };
+      const reqHeaders = buildRequestHeaders(referer);
+      reqHeaders.Host = target.hostname;
       if (proxyAuth) reqHeaders["Proxy-Authorization"] = proxyAuth;
 
       const req = http.request(
@@ -186,14 +214,19 @@ function requestViaProxy(targetUrl, proxyUrl) {
  * Follow redirects hop-by-hop from startUrl, optionally through a proxy.
  * Returns { finalUrl, status, hops }.
  */
-async function traceRedirects(startUrl, proxyUrl) {
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function traceRedirectsOnce(startUrl, proxyUrl) {
   let currentUrl = startUrl;
+  let referer = null;
   let hops = 0;
 
   while (true) {
     const { statusCode, headers } = proxyUrl
-      ? await requestViaProxy(currentUrl, proxyUrl)
-      : await requestDirect(currentUrl);
+      ? await requestViaProxy(currentUrl, proxyUrl, referer)
+      : await requestDirect(currentUrl, referer);
 
     if (!REDIRECT_CODES.has(statusCode)) {
       return { finalUrl: currentUrl, status: statusCode, hops };
@@ -206,13 +239,32 @@ async function traceRedirects(startUrl, proxyUrl) {
 
     const location = headers.location;
     if (!location) {
-      // Redirect status but no Location header — treat as final
       return { finalUrl: currentUrl, status: statusCode, hops: hops - 1 };
     }
 
-    // Resolve relative Location headers against the current URL
+    referer = currentUrl;
     currentUrl = new URL(location, currentUrl).href;
   }
+}
+
+async function traceRedirects(startUrl, proxyUrl) {
+  let lastResult;
+
+  for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
+    lastResult = await traceRedirectsOnce(startUrl, proxyUrl);
+
+    if (lastResult.status === 200) {
+      lastResult.attempts = attempt;
+      return lastResult;
+    }
+
+    if (attempt < MAX_RETRIES) {
+      await delay(RETRY_DELAY_MS);
+    }
+  }
+
+  lastResult.attempts = MAX_RETRIES;
+  return lastResult;
 }
 
 // ─── Routes ──────────────────────────────────────────────────────────────────
@@ -247,9 +299,9 @@ app.get("/trace", async (req, res) => {
   }
 
   try {
-    const { finalUrl, status, hops } = await traceRedirects(url, proxy || null);
+    const { finalUrl, status, hops, attempts } = await traceRedirects(url, proxy || null);
 
-    const response = { input_url: url, final_url: finalUrl, status, hops };
+    const response = { input_url: url, final_url: finalUrl, status, hops, attempts };
     if (proxy) response.proxy = proxy;
 
     return res.json(response);
