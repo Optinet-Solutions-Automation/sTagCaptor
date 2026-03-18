@@ -347,7 +347,7 @@ async function traceRedirects(startUrl, proxyUrl) {
       status: statusCode,
       hops: lastResult.hops,
       attempts: lastResult.attempts,
-      tracking_found: found,
+      found,
       js_rendered: true,
     };
   }
