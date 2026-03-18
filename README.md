@@ -83,6 +83,24 @@ curl "http://localhost:3500/trace?url=https%3A%2F%2Fbit.ly%2F3abc123&proxy=http%
 - **HTTP targets** — the full target URL is forwarded to the proxy as the request path (standard HTTP proxy forwarding).
 - **HTTPS targets** — a `CONNECT` tunnel is opened to the proxy, then TLS is negotiated directly with the target through the tunnel. Each redirect hop is routed through the same proxy.
 
+## ScrapingBee fallback
+
+When a site blocks the tracer (responds with `403`, `429`, or `503`) and all retries are exhausted, the API can fall back to [ScrapingBee](https://www.scrapingbee.com) — a headless Chromium service that handles JS challenges and Cloudflare blocks.
+
+**How to enable:**
+
+1. Set `SCRAPINGBEE_API_KEY` to your ScrapingBee API key
+2. Set `ENABLE_JS_FALLBACK=true`
+
+When the fallback fires, the response includes `"js_rendered": true` so you can tell which path was taken.
+
+| Key | Required | Description |
+|-----|----------|-------------|
+| `SCRAPINGBEE_API_KEY` | Yes (for fallback) | Your ScrapingBee API key |
+| `ENABLE_JS_FALLBACK` | No (default: `false`) | Set to `true` to enable the fallback |
+
+> The fallback uses ScrapingBee's `premium_proxy` and `render_js` options. Its timeout is 3× the normal `TIMEOUT_MS`.
+
 ## Limits
 
 - **Max redirects:** 20 hops
